@@ -1,0 +1,18 @@
+{
+  "name": "confidential-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ConfidentialBridge — FHE-encrypted token bridge built on Fhenix CoFHE",
+  "scripts": {
+    "compile": "pnpm --filter @confidential-bridge/contracts compile",
+    "test": "pnpm --filter @confidential-bridge/contracts test",
+    "deploy-usdc": "pnpm --filter @confidential-bridge/contracts deploy-usdc",
+    "deploy-bridge": "pnpm --filter @confidential-bridge/contracts deploy-bridge",
+    "e2e:bridge": "pnpm --filter @confidential-bridge/contracts e2e:bridge"
+  },
+  "engines": {
+    "node": ">=20",
+    "pnpm": ">=9"
+  },
+  "packageManager": "pnpm@9.12.3"
+}

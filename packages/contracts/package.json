@@ -1,0 +1,39 @@
+{
+	"name": "@confidential-bridge/contracts",
+	"version": "0.1.0",
+	"private": true,
+	"description": "ConfidentialBridge — FHE-encrypted token bridge (CoFHE / Base Sepolia)",
+	"main": "index.ts",
+	"scripts": {
+		"compile": "hardhat compile",
+		"clean": "rimraf ./artifacts ./cache ./typechain-types",
+		"test": "hardhat test --network hardhat",
+		"deploy-usdc": "hardhat deploy-usdc",
+		"deploy-bridge": "hardhat deploy-bridge",
+		"deploy-stack": "hardhat deploy-stack",
+		"e2e:bridge": "hardhat run scripts/e2e-bridge.ts",
+		"e2e:bridge-twochain": "hardhat run scripts/e2e-bridge-twochain.ts",
+		"operator": "hardhat run scripts/operator.ts"
+	},
+	"license": "MIT",
+	"devDependencies": {
+		"@fhenixprotocol/cofhe-contracts": "^0.0.13",
+		"@fhenixprotocol/cofhe-mock-contracts": "^0.3.1",
+		"@nomicfoundation/hardhat-ethers": "^3.0.0",
+		"@nomicfoundation/hardhat-toolbox": "^5.0.0",
+		"@nomicfoundation/hardhat-verify": "^2.0.0",
+		"@openzeppelin/contracts": "^5.2.0",
+		"@typechain/ethers-v6": "^0.5.0",
+		"@typechain/hardhat": "^9.0.0",
+		"@types/node": ">=18.0.0",
+		"cofhe-hardhat-plugin": "^0.3.1",
+		"cofhejs": "^0.3.1",
+		"dotenv": "^16.4.7",
+		"ethers": "^6.13.5",
+		"hardhat": "^2.22.19",
+		"rimraf": "^5.0.0",
+		"ts-node": ">=8.0.0",
+		"typechain": "^8.3.0",
+		"typescript": ">=4.5.0"
+	}
+}
