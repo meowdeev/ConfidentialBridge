@@ -7,28 +7,35 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import "./ConfidentialERC20.sol";
 
-/// @title ConfidentialBridge (v1, trusted operator)
+/// @title ConfidentialBridge (v2, trusted operator, encrypted reserve)
 /// @notice Symmetric bridge for a `ConfidentialERC20` between two CoFHE-live
-///         chains (e.g. Eth Sepolia ↔ Arb Sepolia). Deploy one instance per
-///         chain, pointing at its peer. A single trusted `operator` EOA
-///         serves as the message layer: it watches `BridgeOut` events on
-///         the source, unseals the debit handle off-chain via
-///         `cofhejs.unseal`, and submits the plaintext to the peer's
+///         chains. One instance per chain, pointing at its peer. A single
+///         trusted `operator` EOA serves as the message layer: it watches
+///         `BridgeOut` events on the source, unseals the debit handle
+///         off-chain via `cofhejs.unseal`, then submits the plaintext
+///         re-encrypted under cofhejs as an `InEuint64` to the peer's
 ///         `bridgeIn`.
 ///
-///         Trust model matches `ConfidentialERC20.unwrapper` — the operator
-///         sees plaintext at the crossing point; everything before and
-///         after stays encrypted on-chain.
+///         v2 privacy model: the *amount* stays encrypted on both chains.
+///         The operator sees plaintext off-chain at the crossing point, but
+///         no event or state read ever exposes the bridged amount to
+///         third-party observers. The only plaintext-in-calldata ops are
+///         `seedLiquidity` and `drainReserve` — rebalancing admin actions
+///         that are inherently public because their underlying-token legs
+///         are observable anyway.
 ///
-/// @dev V2 will replace `onlyOperator` on `bridgeIn` with verification
-///      against a messaging layer (CCTP / LayerZero / Hyperlane) and add
-///      timeout-based refunds on the source side.
+/// @dev v1 emitted `plainAmount` in `BridgeOutAcked` / `BridgeIn` and kept a
+///      public `uint64 plainReserve`, which defeated the confidentiality
+///      goal. v2 replaces both: `encReserve` is an `euint64` (ACL'd to the
+///      operator), acks homomorphically fold the stored outbound handle
+///      into it, and bridgeIn takes an `InEuint64` and silent-clamps
+///      against the encrypted reserve — matching ERC-7984 semantics.
 contract ConfidentialBridge {
     using SafeERC20 for IERC20;
 
     ConfidentialERC20 public immutable cToken;
     address public immutable operator;
-    /// @dev Informational only in v1 (the operator enforces peer identity
+    /// @dev Informational only (the operator enforces peer identity
     ///      off-chain). Kept so the contract self-documents its topology.
     uint256 public immutable peerChainId;
 
@@ -45,17 +52,15 @@ contract ConfidentialBridge {
     /// @dev Replay guard for inbound deliveries, keyed by peer's outbound id.
     mapping(uint256 => bool) public inboundSettled;
 
-    /// @notice Plaintext reserve accounting. Grows when the operator wraps
-    ///         underlying via `seedLiquidity` and when they ack an outbound
-    ///         (pinning the user's bridged-out plaintext so future
-    ///         `bridgeIn` calls can pay it out). Shrinks on `bridgeIn` and
-    ///         `drainReserve`.
+    /// @notice Encrypted reserve. Grows on `seedLiquidity` and on every
+    ///         `ackOutbound` (folding the stored outbound's encrypted
+    ///         amount in homomorphically). Shrinks on `bridgeIn` (silent-
+    ///         clamped against itself) and `drainReserve`.
     ///
-    ///         `bridgeIn` is gated by this counter so an empty reserve
-    ///         fails loudly instead of silently transferring 0 — the one
-    ///         place the underlying cToken's clamp-on-insufficient
-    ///         semantics would be user-hostile (replay flag already set).
-    uint64 public plainReserve;
+    ///         Only the operator has decrypt ACL, so only they can see the
+    ///         absolute value. Deltas from seed/drain leak through plaintext
+    ///         calldata but that's inherent to those admin ops.
+    euint64 public encReserve;
 
     event BridgeOut(
         uint256 indexed outboundId,
@@ -63,14 +68,17 @@ contract ConfidentialBridge {
         address indexed destRecipient,
         uint256 encAmountHandle
     );
-    event BridgeOutAcked(uint256 indexed outboundId, uint64 plainAmount);
+    /// @dev No `plainAmount` — that was the v1 leak. Off-chain listeners
+    ///      key off `outboundId` and cross-reference `outbound[id].encAmount`
+    ///      if they need the handle.
+    event BridgeOutAcked(uint256 indexed outboundId);
     event BridgeIn(
         uint256 indexed peerOutboundId,
         address indexed recipient,
-        uint64 plainAmount
+        uint256 encAmountHandle
     );
-    event ReserveSeeded(uint64 amount, uint64 newReserve);
-    event ReserveDrained(address indexed to, uint64 amount, uint64 newReserve);
+    event ReserveSeeded(uint64 amount);
+    event ReserveDrained(address indexed to, uint64 amount);
 
     modifier onlyOperator() {
         require(msg.sender == operator, "not operator");
@@ -86,6 +94,10 @@ contract ConfidentialBridge {
         cToken = _cToken;
         operator = _operator;
         peerChainId = _peerChainId;
+
+        encReserve = FHE.asEuint64(0);
+        FHE.allowThis(encReserve);
+        FHE.allow(encReserve, _operator);
     }
 
     // ───── outbound (source side) ────────────────────────────────────────
@@ -119,80 +131,103 @@ contract ConfidentialBridge {
         emit BridgeOut(outboundId, msg.sender, destRecipient, euint64.unwrap(moved));
     }
 
-    /// @notice Operator pins the plaintext of an outbound and credits the
-    ///         local `plainReserve` so this side can pay out future
-    ///         `bridgeIn` deliveries from the peer (self-balancing
-    ///         round-trips). The value is trusted — operator already sees
-    ///         the plaintext via its decrypt ACL.
-    function ackOutbound(uint256 outboundId, uint64 plainAmount)
-        external
-        onlyOperator
-    {
+    /// @notice Operator pins the outbound and grows the encrypted local
+    ///         reserve by the stored `encAmount` — no plaintext in
+    ///         calldata, no plaintext in the event. The homomorphic add
+    ///         keeps reserve balance in lockstep with what actually moved
+    ///         into the bridge on `bridgeOut`.
+    function ackOutbound(uint256 outboundId) external onlyOperator {
         Outbound storage o = outbound[outboundId];
         require(o.sender != address(0), "unknown outbound");
         require(!o.operatorAcked, "already acked");
         o.operatorAcked = true;
-        plainReserve += plainAmount;
-        emit BridgeOutAcked(outboundId, plainAmount);
+
+        encReserve = FHE.add(encReserve, o.encAmount);
+        FHE.allowThis(encReserve);
+        FHE.allow(encReserve, operator);
+
+        emit BridgeOutAcked(outboundId);
     }
 
     // ───── inbound (destination side) ────────────────────────────────────
 
     /// @notice Operator delivers a peer-side outbound by crediting
-    ///         `recipient` with `plainAmount` cToken from this bridge's
-    ///         reserves. Idempotent via `inboundSettled`. Reverts if the
-    ///         plaintext reserve is insufficient — this is the loud-fail
-    ///         replacement for cToken's silent-clamp behaviour.
+    ///         `recipient` with the encrypted `encAmount` from this
+    ///         bridge's reserves. Idempotent via `inboundSettled`. Silent-
+    ///         clamps against `encReserve` (ERC-7984 semantics) — if the
+    ///         reserve is short, zero transfers but the replay flag still
+    ///         trips. Operator is responsible for checking reserve
+    ///         sufficiency off-chain (they have the ACL) before submitting.
+    ///
+    ///         `encAmount` must be signed by the operator for their own
+    ///         `msg.sender`; cofhejs handles that when the operator runs
+    ///         `cofhejs.encrypt(plain)` after unsealing the source-side
+    ///         handle.
     function bridgeIn(
         uint256 peerOutboundId,
         address recipient,
-        uint64 plainAmount
+        InEuint64 calldata encAmount
     ) external onlyOperator {
         require(!inboundSettled[peerOutboundId], "already settled");
         require(recipient != address(0), "recipient=0");
-        require(plainAmount <= plainReserve, "reserve empty");
 
         inboundSettled[peerOutboundId] = true;
-        plainReserve -= plainAmount;
 
-        if (plainAmount > 0) {
-            euint64 enc = FHE.asEuint64(plainAmount);
-            FHE.allowThis(enc);
-            FHE.allowTransient(enc, address(cToken));
-            cToken.transferEncrypted(recipient, enc);
-        }
+        euint64 requested = FHE.asEuint64(encAmount);
+        ebool ok = FHE.gte(encReserve, requested);
+        euint64 actual = FHE.select(ok, requested, FHE.asEuint64(0));
 
-        emit BridgeIn(peerOutboundId, recipient, plainAmount);
+        encReserve = FHE.sub(encReserve, actual);
+        FHE.allowThis(encReserve);
+        FHE.allow(encReserve, operator);
+
+        FHE.allowThis(actual);
+        FHE.allowTransient(actual, address(cToken));
+        cToken.transferEncrypted(recipient, actual);
+
+        emit BridgeIn(peerOutboundId, recipient, euint64.unwrap(actual));
     }
 
     // ───── liquidity management ──────────────────────────────────────────
 
     /// @notice Operator pulls underlying from themselves, wraps it into
-    ///         cToken held by this bridge, and credits plaintext reserve.
+    ///         cToken held by this bridge, and credits the encrypted
+    ///         reserve. Seed amount is plaintext — the underlying-ERC20
+    ///         leg is already public, so there's nothing to hide here.
     function seedLiquidity(uint64 amount) external onlyOperator {
         IERC20 u = cToken.underlying();
         u.safeTransferFrom(msg.sender, address(this), amount);
         u.forceApprove(address(cToken), amount);
         cToken.wrap(amount);
-        plainReserve += amount;
-        emit ReserveSeeded(amount, plainReserve);
+
+        encReserve = FHE.add(encReserve, FHE.asEuint64(amount));
+        FHE.allowThis(encReserve);
+        FHE.allow(encReserve, operator);
+
+        emit ReserveSeeded(amount);
     }
 
-    /// @notice Operator drains `amount` of reserve out to `to` as cToken.
-    ///         The recipient can unwrap on their own. Exists so the bridge
-    ///         can be rebalanced across chains (e.g. via CCTP). Amount is
-    ///         plaintext because the operator already sees reserve values
-    ///         and rebalancing is a public admin action.
+    /// @notice Operator drains `amount` of reserve to `to` as cToken.
+    ///         Silent-clamped against `encReserve` (see `bridgeIn` for
+    ///         rationale): if the reserve is short, zero moves rather
+    ///         than corrupting the encrypted counter via underflow. The
+    ///         receiving side can unwrap on its own — exists so the
+    ///         bridge can be rebalanced across chains (e.g. via CCTP).
     function drainReserve(address to, uint64 amount) external onlyOperator {
         require(to != address(0), "to=0");
-        require(amount <= plainReserve, "reserve empty");
-        plainReserve -= amount;
 
-        euint64 enc = FHE.asEuint64(amount);
-        FHE.allowThis(enc);
-        FHE.allowTransient(enc, address(cToken));
-        cToken.transferEncrypted(to, enc);
+        euint64 requested = FHE.asEuint64(amount);
+        ebool ok = FHE.gte(encReserve, requested);
+        euint64 actual = FHE.select(ok, requested, FHE.asEuint64(0));
 
-        emit ReserveDrained(to, amount, plainReserve);
+        encReserve = FHE.sub(encReserve, actual);
+        FHE.allowThis(encReserve);
+        FHE.allow(encReserve, operator);
+
+        FHE.allowThis(actual);
+        FHE.allowTransient(actual, address(cToken));
+        cToken.transferEncrypted(to, actual);
+
+        emit ReserveDrained(to, amount);
     }
 }

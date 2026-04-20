@@ -8,7 +8,10 @@
     "test": "pnpm --filter @confidential-bridge/contracts test",
     "deploy-usdc": "pnpm --filter @confidential-bridge/contracts deploy-usdc",
     "deploy-bridge": "pnpm --filter @confidential-bridge/contracts deploy-bridge",
-    "e2e:bridge": "pnpm --filter @confidential-bridge/contracts e2e:bridge"
+    "deploy-stack": "pnpm --filter @confidential-bridge/contracts deploy-stack",
+    "e2e:bridge": "pnpm --filter @confidential-bridge/contracts e2e:bridge",
+    "e2e:bridge-twochain": "pnpm --filter @confidential-bridge/contracts e2e:bridge-twochain",
+    "operator": "pnpm --filter @confidential-bridge/contracts operator"
   },
   "engines": {
     "node": ">=20",

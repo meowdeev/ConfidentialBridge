@@ -42,8 +42,14 @@ const config: HardhatUserConfig = {
 			timeout: 60000,
 		},
 	},
+	// Etherscan V2 unified API — one key, resolved per-chain by chainId.
 	etherscan: {
-		apiKey: process.env.BASESCAN_API_KEY || '',
+		apiKey: process.env.ETHERSCAN_API_KEY || process.env.BASESCAN_API_KEY || '',
+	},
+	mocha: {
+		// Force coloured output even when piped (e.g. `make test | tee`).
+		color: true,
+		reporter: 'spec',
 	},
 }
 

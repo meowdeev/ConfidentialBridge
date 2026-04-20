@@ -182,7 +182,7 @@ async function main() {
 	await seedTx.wait()
 	console.log(`  Seed tx: ${seedTx.hash}`)
 	if (explorer) console.log(txLink(seedTx.hash))
-	console.log(`  bridgeB.plainReserve: ${Number(await bridgeB.plainReserve()) / 1e6} USDC\n`)
+	console.log(`  bridgeB.encReserve (handle only; operator unseals off-chain)\n`)
 
 	// ── 5. Buyer wraps USDC → cUSDC ────────────────────────
 	console.log(`⑤ Buyer wraps ${Number(PAY) / 1e6} USDC → cUSDC...`)
@@ -247,28 +247,25 @@ async function main() {
 	}
 
 	// ── 9. Operator acks on source (grows A's reserve) ─────
-	console.log('⑨ Operator acks outbound on bridgeA (source-side reserve credit)...')
-	const ackTx = await (bridgeA.connect(operator) as any).ackOutbound(outboundId, plain)
+	console.log('⑨ Operator acks outbound on bridgeA (no plaintext in calldata/event)...')
+	const ackTx = await (bridgeA.connect(operator) as any).ackOutbound(outboundId)
 	await ackTx.wait()
 	console.log(`  ack tx: ${ackTx.hash}`)
 	if (explorer) console.log(txLink(ackTx.hash))
-	console.log(`  bridgeA.plainReserve: ${Number(await bridgeA.plainReserve()) / 1e6} USDC\n`)
 
 	// ── 10. Operator delivers on destination ───────────────
-	console.log('⑩ Operator delivers on bridgeB (destination-side credit)...')
-	const reserveBefore = await bridgeB.plainReserve()
+	console.log('⑩ Operator delivers on bridgeB (encrypted amount via InEuint64)...')
+	const [encDeliver] = await hre.cofhe.expectResultSuccess(
+		cofhejs.encrypt([Encryptable.uint64(plain)] as const)
+	)
 	const bridgeInTx = await (bridgeB.connect(operator) as any).bridgeIn(
 		outboundId,
 		operator.address,
-		plain
+		encDeliver
 	)
 	await bridgeInTx.wait()
 	console.log(`  bridgeIn tx: ${bridgeInTx.hash}`)
 	if (explorer) console.log(txLink(bridgeInTx.hash))
-	const reserveAfter = await bridgeB.plainReserve()
-	console.log(
-		`  bridgeB.plainReserve: ${Number(reserveBefore) / 1e6} → ${Number(reserveAfter) / 1e6} USDC\n`
-	)
 
 	// ── 11. Verify recipient's encrypted balance ───────────
 	console.log('⑪ Verifying recipient (operator) cUSDC balance via FHE unseal...')
@@ -282,23 +279,66 @@ async function main() {
 	}
 	const recipientBal = await tryUnseal<bigint>(recipientBalHandle, FheTypes.Uint64)
 	if (recipientBal === null) {
-		console.log('  FHE unseal still pending — operator can re-check later.')
+		console.log('  FHE unseal still pending — skipping unwrap. Re-run later.')
 	} else {
 		console.log(`  Operator cUSDC balance: ${Number(recipientBal) / 1e6}`)
-		if (recipientBal >= plain) {
-			console.log(`  ✓ delivered ≥ ${Number(plain) / 1e6} USDC (operator may already hold cUSDC from seed)`)
-		} else {
+		if (recipientBal < plain) {
 			console.log(`  ⚠  expected at least ${Number(plain) / 1e6}, got ${Number(recipientBal) / 1e6}`)
+		}
+
+		// ── 12. Recipient unwraps cUSDC → USDC ──────────────
+		console.log(`\n⑫ Recipient unwraps ${Number(plain) / 1e6} cUSDC → USDC...`)
+		const usdcBefore: bigint = await (usdc as any).balanceOf(operator.address)
+		const [encUnwrap] = await hre.cofhe.expectResultSuccess(
+			cofhejs.encrypt([Encryptable.uint64(plain)] as const)
+		)
+		const reqTx = await (cUSDC.connect(operator) as any).requestUnwrap(encUnwrap)
+		const reqReceipt = await reqTx.wait()
+		console.log(`  requestUnwrap tx: ${reqTx.hash}`)
+		if (explorer) console.log(txLink(reqTx.hash))
+
+		const unwrapLog = reqReceipt!.logs.find((log: any) => {
+			try {
+				return (
+					cUSDC.interface.parseLog({ topics: log.topics as string[], data: log.data })?.name ===
+					'UnwrapRequested'
+				)
+			} catch {
+				return false
+			}
+		})
+		const unwrapParsed = cUSDC.interface.parseLog({
+			topics: unwrapLog!.topics as string[],
+			data: unwrapLog!.data,
+		})!
+		const unwrapId: bigint = unwrapParsed.args.unwrapId
+		const debitHandle: bigint = unwrapParsed.args.encAmountHandle
+
+		const debitPlain = await tryUnseal<bigint>(debitHandle, FheTypes.Uint64)
+		if (debitPlain === null) {
+			console.log(`  FHE unseal still pending — recipient can call claimUnwrap later.`)
+			console.log(`  unwrapId=${unwrapId}`)
+		} else {
+			const claimTx = await (cUSDC.connect(operator) as any).claimUnwrap(unwrapId, debitPlain)
+			await claimTx.wait()
+			console.log(`  claimUnwrap tx: ${claimTx.hash}`)
+			if (explorer) console.log(txLink(claimTx.hash))
+
+			const usdcAfter: bigint = await (usdc as any).balanceOf(operator.address)
+			console.log(
+				`  operator USDC: ${Number(usdcBefore) / 1e6} → ${Number(usdcAfter) / 1e6}  (+${Number(usdcAfter - usdcBefore) / 1e6})`
+			)
 		}
 	}
 
-	console.log('\n── Privacy summary ──')
+	console.log('\n── Privacy summary (v2) ──')
 	console.log('✓ encAmount   — FHE-encrypted on bridgeA, only operator could unseal')
 	console.log('✓ allowance   — encrypted on cUSDC; bridge consumed via transferFromAllowance')
 	console.log('✓ debit       — bridgeA holds the encrypted handle; ACL granted to operator')
-	console.log('✓ delivery    — operator submits plaintext via onlyOperator-gated bridgeIn')
+	console.log('✓ ack         — homomorphic add into encReserve; no plaintext in calldata/event')
+	console.log('✓ delivery    — operator submits InEuint64; BridgeIn event emits handle only')
+	console.log('✓ reserve     — encReserve is euint64; only operator (ACL) can read the value')
 	console.log('✓ replay      — inboundSettled[outboundId] flag prevents double-credit')
-	console.log('✓ reserve     — plainReserve gates bridgeIn; insufficient → revert (not silent zero)')
 }
 
 main().catch(err => {

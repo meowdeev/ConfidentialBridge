@@ -143,10 +143,13 @@ async function main() {
 	}
 	console.log()
 
-	// ── Pre-flight: dst bridge has plainReserve ────────────
+	// ── Pre-flight: dst bridge has encReserve ──────────────
 	console.log('② Pre-flight: ensuring destination bridge has reserve...')
-	const dstReserve: bigint = await bridgeDst.plainReserve()
-	console.log(`   bridge.plainReserve on ${dst.name}: ${Number(dstReserve) / 1e6} USDC`)
+	// v2: reserve is FHE-encrypted, only the operator (ACL'd) can unseal.
+	await initCofhe(dst.operator)
+	const dstReserveHandle: bigint = await bridgeDst.encReserve()
+	const dstReserve: bigint = (await tryUnseal<bigint>(dstReserveHandle, FheTypes.Uint64, 3, 3000)) ?? 0n
+	console.log(`   bridge.encReserve on ${dst.name}: ${Number(dstReserve) / 1e6} USDC (via operator unseal)`)
 	if (dstReserve < PAY) {
 		const seedAmt = SEED - dstReserve
 		console.log(`   seeding ${Number(seedAmt) / 1e6} more USDC into ${dst.name} bridge...`)
@@ -205,23 +208,37 @@ async function main() {
 	console.log(`   plaintext: ${Number(plain) / 1e6} USDC\n`)
 
 	// ── 6. Operator acks on src ─────────────────────────────
-	console.log(`⑥ Operator acks outbound on ${src.name}...`)
-	const ackTx = await (bridgeSrcOp as any).ackOutbound(outboundId, plain)
+	console.log(`⑥ Operator acks outbound on ${src.name}... (no plaintext in calldata/event)`)
+	const ackTx = await (bridgeSrcOp as any).ackOutbound(outboundId)
 	await ackTx.wait()
 	console.log(`   ack tx: ${ackTx.hash}`)
 	if (EXPLORERS[src.name]) console.log(txLink(src.name, ackTx.hash))
-	console.log(`   bridgeSrc.plainReserve: ${Number(await bridgeSrc.plainReserve()) / 1e6} USDC\n`)
+	// Operator can unseal their own reserve to confirm the grow; observers cannot.
+	const srcReserveHandle: bigint = await bridgeSrc.encReserve()
+	const srcReserve = await tryUnseal<bigint>(srcReserveHandle, FheTypes.Uint64, 3, 3000)
+	if (srcReserve !== null) {
+		console.log(`   bridgeSrc.encReserve (operator-only view): ${Number(srcReserve) / 1e6} USDC\n`)
+	} else {
+		console.log(`   bridgeSrc.encReserve: handle=${srcReserveHandle} (unseal pending)\n`)
+	}
 
 	// ── 7. Operator delivers on dst ─────────────────────────
-	console.log(`⑦ Operator delivers on ${dst.name}...`)
-	const reserveBefore: bigint = await bridgeDst.plainReserve()
-	const bridgeInTx = await (bridgeDst as any).bridgeIn(outboundId, dst.operator.address, plain)
+	console.log(`⑦ Operator delivers on ${dst.name}... (encrypts plain → InEuint64 on dst chain)`)
+	// Re-init cofhejs for the destination chain/operator before encrypting.
+	await initCofhe(dst.operator)
+	const dstReserveBeforeHandle: bigint = await bridgeDst.encReserve()
+	const reserveBefore = (await tryUnseal<bigint>(dstReserveBeforeHandle, FheTypes.Uint64, 3, 3000)) ?? 0n
+	const [encDeliver] = await hre.cofhe.expectResultSuccess(
+		cofhejs.encrypt([Encryptable.uint64(plain)] as const)
+	)
+	const bridgeInTx = await (bridgeDst as any).bridgeIn(outboundId, dst.operator.address, encDeliver)
 	await bridgeInTx.wait()
 	console.log(`   bridgeIn tx: ${bridgeInTx.hash}`)
 	if (EXPLORERS[dst.name]) console.log(txLink(dst.name, bridgeInTx.hash))
-	const reserveAfter: bigint = await bridgeDst.plainReserve()
+	const dstReserveAfterHandle: bigint = await bridgeDst.encReserve()
+	const reserveAfter = (await tryUnseal<bigint>(dstReserveAfterHandle, FheTypes.Uint64, 3, 3000)) ?? 0n
 	console.log(
-		`   bridgeDst.plainReserve: ${Number(reserveBefore) / 1e6} → ${Number(reserveAfter) / 1e6} USDC\n`
+		`   bridgeDst.encReserve (operator-only): ${Number(reserveBefore) / 1e6} → ${Number(reserveAfter) / 1e6} USDC\n`
 	)
 
 	// ── 8. Verify recipient cUSDC balance on dst ────────────
@@ -236,13 +253,65 @@ async function main() {
 	}
 	const recipientBal = await tryUnseal<bigint>(recipientHandle, FheTypes.Uint64)
 	if (recipientBal === null) {
-		console.log(`   FHE unseal still pending — try again later.`)
-	} else {
-		console.log(`   operator cUSDC on ${dst.name}: ${Number(recipientBal) / 1e6}`)
-		console.log(`   ✓ delivered ≥ ${Number(plain) / 1e6} USDC`)
+		console.log(`   FHE unseal still pending — try again later; skipping unwrap.`)
+		console.log('\n── Two-chain bridge complete ──')
+		return
 	}
+	console.log(`   operator cUSDC on ${dst.name}: ${Number(recipientBal) / 1e6}`)
+	console.log(`   ✓ delivered ≥ ${Number(plain) / 1e6} USDC\n`)
 
-	console.log('\n── Two-chain bridge complete ──')
+	// ── 9. Recipient unwraps cUSDC → USDC on dst ────────────
+	console.log(`⑨ Recipient requests unwrap on ${dst.name} (${Number(plain) / 1e6} cUSDC → USDC)...`)
+	const cUSDCDstOp = new ethers.Contract(dst.stack.cToken, cUSDCArt.abi, dst.operator)
+	const usdcBefore: bigint = await usdcDst.balanceOf(dst.operator.address)
+
+	// Encrypted amount, signed for the recipient (operator is its own
+	// destRecipient in this e2e). Signature is bound to msg.sender, which
+	// matches since the operator wallet submits the tx directly.
+	const [encUnwrapAmt] = await hre.cofhe.expectResultSuccess(
+		cofhejs.encrypt([Encryptable.uint64(plain)] as const)
+	)
+	const reqTx = await (cUSDCDstOp as any).requestUnwrap(encUnwrapAmt)
+	const reqReceipt = await reqTx.wait()
+	console.log(`   requestUnwrap tx: ${reqTx.hash}`)
+	if (EXPLORERS[dst.name]) console.log(txLink(dst.name, reqTx.hash))
+
+	const unwrapLog = reqReceipt!.logs
+		.map((l: any) => {
+			try {
+				return cUSDCDstOp.interface.parseLog({ topics: l.topics, data: l.data })
+			} catch {
+				return null
+			}
+		})
+		.find((p: any) => p?.name === 'UnwrapRequested')
+	if (!unwrapLog) throw new Error('UnwrapRequested log not found')
+	const unwrapId: bigint = unwrapLog.args.unwrapId
+	const debitHandle: bigint = unwrapLog.args.encAmountHandle
+	console.log(`   unwrapId    : ${unwrapId}`)
+	console.log(`   debitHandle : ${debitHandle} (opaque)\n`)
+
+	// ── 10. Operator unseals debit and claims ───────────────
+	console.log(`⑩ Operator unseals debit handle + calls claimUnwrap...`)
+	const debitPlain = await tryUnseal<bigint>(debitHandle, FheTypes.Uint64)
+	if (debitPlain === null) {
+		console.log(`   FHE unseal still pending — recipient can call claimUnwrap later.`)
+		console.log(`   unwrapId=${unwrapId} on cUSDC ${dst.stack.cToken}`)
+		return
+	}
+	console.log(`   debit plaintext: ${Number(debitPlain) / 1e6} USDC`)
+	const claimTx = await (cUSDCDstOp as any).claimUnwrap(unwrapId, debitPlain)
+	await claimTx.wait()
+	console.log(`   claimUnwrap tx: ${claimTx.hash}`)
+	if (EXPLORERS[dst.name]) console.log(txLink(dst.name, claimTx.hash))
+
+	const usdcAfter: bigint = await usdcDst.balanceOf(dst.operator.address)
+	console.log(
+		`   operator USDC on ${dst.name}: ${Number(usdcBefore) / 1e6} → ${Number(usdcAfter) / 1e6}`
+	)
+	console.log(`   delta: +${Number(usdcAfter - usdcBefore) / 1e6} USDC`)
+
+	console.log('\n── Two-chain bridge complete (bridged + unwrapped end-to-end) ──')
 	console.log(`Source     : ${src.name}  bridge=${src.stack.bridge}`)
 	console.log(`Destination: ${dst.name}  bridge=${dst.stack.bridge}`)
 }
